@@ -5,9 +5,10 @@ import time
 import requests
 import websocket
 import threading
+import ssl
 from keep_alive import keep_alive
 
-status = os.getenv("status")  # online/dnd/idle
+status = os.getenv("status", "online")  # online/dnd/idle
 custom_status = os.getenv("custom_status")  # Custom status text
 usertoken = os.getenv("token")
 
@@ -18,9 +19,14 @@ if not usertoken:
 headers = {"Authorization": usertoken, "Content-Type": "application/json"}
 
 # Validate token
-validate = requests.get("https://discord.com/api/v9/users/@me", headers=headers)
-if validate.status_code != 200:
-    print("[ERROR] Your token might be invalid. Please check it again.")
+try:
+    validate = requests.get("https://discord.com/api/v9/users/@me", headers=headers, timeout=10)
+    if validate.status_code != 200:
+        print("[ERROR] Your token might be invalid. Please check it again.")
+        print(f"[DEBUG] Status code: {validate.status_code}")
+        sys.exit()
+except requests.exceptions.RequestException as e:
+    print(f"[ERROR] Failed to validate token: {e}")
     sys.exit()
 
 userinfo = requests.get("https://discord.com/api/v9/users/@me", headers=headers).json()
@@ -38,18 +44,42 @@ class DiscordStatusBot:
         self.should_heartbeat = False
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
+        self.sequence = None
+        self.session_id = None
         
     def connect(self):
         try:
-            self.ws = websocket.WebSocket()
-            # Add timeout and better connection options
+            # Enable SSL debugging for troubleshooting
+            websocket.enableTrace(False)  # Set to True for debugging
+            
+            # Create WebSocket with SSL context
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            self.ws = websocket.WebSocket(sslopt={"cert_reqs": ssl.CERT_NONE})
             self.ws.settimeout(30)
-            self.ws.connect("wss://gateway.discord.gg/?v=9&encoding=json", 
-                          header={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            
+            # Connect with proper headers
+            self.ws.connect(
+                "wss://gateway.discord.gg/?v=9&encoding=json",
+                header={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                }
+            )
+            
+            print("[INFO] WebSocket connected successfully")
             
             # Receive hello event
-            hello = json.loads(self.ws.recv())
+            hello_data = self.ws.recv()
+            hello = json.loads(hello_data)
+            
+            if hello.get("op") != 10:
+                print(f"[ERROR] Expected hello event (op 10), got: {hello}")
+                return False
+                
             self.heartbeat_interval = hello["d"]["heartbeat_interval"] / 1000
+            print(f"[INFO] Heartbeat interval: {self.heartbeat_interval}s")
             
             # Start heartbeat in separate thread
             self.should_heartbeat = True
@@ -60,18 +90,39 @@ class DiscordStatusBot:
             # Send identification
             self.identify()
             
-            # Send custom status
-            self.update_status()
-            
             # Listen for events
             self.listen()
             
+        except ssl.SSLError as e:
+            print(f"[ERROR] SSL Error: {e}")
+            self.reconnect()
         except websocket.WebSocketException as e:
             print(f"[ERROR] WebSocket connection failed: {e}")
             self.reconnect()
         except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}")
+            print(f"[ERROR] Unexpected error during connection: {e}")
             self.reconnect()
+    
+    def safe_send(self, data):
+        """Safely send data through WebSocket with error handling"""
+        try:
+            if self.ws and self.ws.connected:
+                self.ws.send(json.dumps(data))
+                return True
+            else:
+                print("[WARNING] WebSocket not connected, cannot send data")
+                return False
+        except ssl.SSLError as e:
+            print(f"[ERROR] SSL error while sending: {e}")
+            self.reconnect()
+            return False
+        except websocket.WebSocketConnectionClosedException:
+            print("[WARNING] Connection closed while sending data")
+            self.reconnect()
+            return False
+        except Exception as e:
+            print(f"[ERROR] Error while sending data: {e}")
+            return False
     
     def identify(self):
         auth = {
@@ -79,9 +130,9 @@ class DiscordStatusBot:
             "d": {
                 "token": self.token,
                 "properties": {
-                    "$os": "Windows",
-                    "$browser": "Chrome",
-                    "$device": "Desktop",
+                    "$os": "linux",
+                    "$browser": "my_library",
+                    "$device": "my_library",
                 },
                 "presence": {
                     "status": self.status,
@@ -89,67 +140,115 @@ class DiscordStatusBot:
                 },
             },
         }
-        self.ws.send(json.dumps(auth))
+        
+        if self.safe_send(auth):
+            print("[INFO] Identification sent")
+        else:
+            print("[ERROR] Failed to send identification")
     
     def update_status(self):
+        activities = []
         if custom_status:
-            cstatus = {
-                "op": 3,
-                "d": {
-                    "since": 0,
-                    "activities": [
-                        {
-                            "type": 4,
-                            "state": custom_status,
-                            "name": "Custom Status",
-                            "id": "custom",
-                        }
-                    ],
-                    "status": self.status,
-                    "afk": False,
-                },
-            }
-            self.ws.send(json.dumps(cstatus))
+            activities.append({
+                "type": 4,
+                "state": custom_status,
+                "name": "Custom Status",
+                "id": "custom",
+            })
+        
+        status_update = {
+            "op": 3,
+            "d": {
+                "since": 0,
+                "activities": activities,
+                "status": self.status,
+                "afk": False,
+            },
+        }
+        
+        if self.safe_send(status_update):
+            print(f"[INFO] Status updated to '{self.status}'")
+            if custom_status:
+                print(f"[INFO] Custom status set to '{custom_status}'")
+        else:
+            print("[ERROR] Failed to update status")
     
     def heartbeat_loop(self):
         while self.should_heartbeat:
             try:
                 time.sleep(self.heartbeat_interval)
                 if self.ws and self.should_heartbeat:
-                    heartbeat = {"op": 1, "d": None}
-                    self.ws.send(json.dumps(heartbeat))
+                    heartbeat = {"op": 1, "d": self.sequence}
+                    if not self.safe_send(heartbeat):
+                        print("[ERROR] Failed to send heartbeat")
+                        break
             except Exception as e:
-                print(f"[ERROR] Heartbeat failed: {e}")
+                print(f"[ERROR] Heartbeat loop error: {e}")
                 break
     
     def listen(self):
         try:
             while True:
-                response = self.ws.recv()
-                data = json.loads(response)
-                
-                # Handle different opcodes
-                if data["op"] == 11:  # Heartbeat ACK
+                try:
+                    response = self.ws.recv()
+                    if not response:
+                        print("[WARNING] Received empty response")
+                        continue
+                        
+                    data = json.loads(response)
+                    
+                    # Update sequence number
+                    if data.get("s"):
+                        self.sequence = data["s"]
+                    
+                    # Handle different opcodes
+                    if data["op"] == 0:  # Dispatch
+                        if data["t"] == "READY":
+                            self.session_id = data["d"]["session_id"]
+                            print(f"[INFO] Bot ready! Session ID: {self.session_id}")
+                            # Update status after ready
+                            time.sleep(1)  # Small delay
+                            self.update_status()
+                        elif data["t"] == "RESUMED":
+                            print("[INFO] Session resumed")
+                            
+                    elif data["op"] == 11:  # Heartbeat ACK
+                        continue
+                        
+                    elif data["op"] == 7:  # Reconnect
+                        print("[INFO] Discord requested reconnection")
+                        self.reconnect()
+                        break
+                        
+                    elif data["op"] == 9:  # Invalid Session
+                        print("[WARNING] Invalid session")
+                        if data.get("d"):
+                            print("[INFO] Session is resumable")
+                        else:
+                            print("[INFO] Session is not resumable, starting fresh")
+                            self.session_id = None
+                        time.sleep(5)
+                        self.reconnect()
+                        break
+                        
+                except json.JSONDecodeError as e:
+                    print(f"[ERROR] Failed to decode JSON: {e}")
                     continue
-                elif data["op"] == 7:  # Reconnect
-                    print("[INFO] Discord requested reconnection")
-                    self.reconnect()
-                    break
-                elif data["op"] == 9:  # Invalid Session
-                    print("[WARNING] Invalid session, reconnecting...")
-                    time.sleep(5)
-                    self.reconnect()
-                    break
                     
         except websocket.WebSocketConnectionClosedException:
             print("[WARNING] WebSocket connection closed")
+            self.reconnect()
+        except ssl.SSLError as e:
+            print(f"[ERROR] SSL error in listen loop: {e}")
             self.reconnect()
         except Exception as e:
             print(f"[ERROR] Error in listen loop: {e}")
             self.reconnect()
     
     def reconnect(self):
+        print("[INFO] Starting reconnection process...")
         self.should_heartbeat = False
+        
         if self.ws:
             try:
                 self.ws.close()
@@ -167,16 +266,26 @@ class DiscordStatusBot:
             sys.exit(1)
     
     def close(self):
+        print("[INFO] Closing bot...")
         self.should_heartbeat = False
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=2)
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except:
+                pass
 
 def run_bot():
     os.system("clear")
-    print(f"Logged in as {username}#{discriminator} ({userid}).")
+    print("=" * 50)
+    print("Discord Status Bot")
+    print("=" * 50)
+    print(f"Logged in as {username}#{discriminator} ({userid})")
     print(f"Status: {status}")
     if custom_status:
         print(f"Custom Status: {custom_status}")
+    print("=" * 50)
     
     bot = DiscordStatusBot(usertoken, status)
     
